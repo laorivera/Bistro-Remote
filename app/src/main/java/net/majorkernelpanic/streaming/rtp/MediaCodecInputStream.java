@@ -39,10 +39,10 @@ public class MediaCodecInputStream extends InputStream {
 
 	private MediaCodec mMediaCodec = null;
 	private BufferInfo mBufferInfo = new BufferInfo();
-	private ByteBuffer[] mBuffers = null;
 	private ByteBuffer mBuffer = null;
 	private int mIndex = -1;
 	private boolean mClosed = false;
+	private boolean mStreamParametersSet = false;
 
 	private H264Packetizer mH264Packetizer;
 
@@ -50,7 +50,6 @@ public class MediaCodecInputStream extends InputStream {
 
 	public MediaCodecInputStream(MediaCodec mediaCodec) {
 		mMediaCodec = mediaCodec;
-		mBuffers = mMediaCodec.getOutputBuffers();
 	}
 
 	@Override
@@ -73,29 +72,15 @@ public class MediaCodecInputStream extends InputStream {
 					mIndex = mMediaCodec.dequeueOutputBuffer(mBufferInfo, 500000);
 					if (mIndex>=0 ){
 						//Log.d(TAG,"Index: "+mIndex+" Time: "+mBufferInfo.presentationTimeUs+" size: "+mBufferInfo.size);
-						mBuffer = mBuffers[mIndex];
+						mBuffer = mMediaCodec.getOutputBuffer(mIndex);
 						mBuffer.position(0);
+						// Fallback: some encoders never (reliably) report INFO_OUTPUT_FORMAT_CHANGED,
+						// so make sure SPS/PPS are grabbed at the latest by the first real buffer.
+						extractStreamParametersIfNeeded();
 						break;
-					} else if (mIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-						mBuffers = mMediaCodec.getOutputBuffers();
 					} else if (mIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
 						mMediaFormat = mMediaCodec.getOutputFormat();
-
-						ByteBuffer spsBuffer = mMediaFormat.getByteBuffer("csd-0");
-						ByteBuffer ppsBuffer = mMediaFormat.getByteBuffer("csd-1");
-						// Real data are preceded by \x00\x00\x00\x01, skip this prefix
-                        // https://developer.android.com/reference/android/media/MediaCodec
-						spsBuffer.position(4);
-						ppsBuffer.position(4);
-						byte[] sps = new byte[spsBuffer.remaining()];
-						byte[] pps = new byte[ppsBuffer.remaining()];
-						spsBuffer.get(sps);
-						ppsBuffer.get(pps);
-
-						if (mH264Packetizer != null) {
-							mH264Packetizer.setStreamParameters(pps, sps);
-						}
-
+						extractStreamParametersIfNeeded();
 						Log.i(TAG,mMediaFormat.toString());
 					} else if (mIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
 						Log.v(TAG,"No buffer available...");
@@ -104,23 +89,57 @@ public class MediaCodecInputStream extends InputStream {
 						Log.e(TAG,"Message: "+mIndex);
 						//return 0;
 					}
-				}			
+				}
 			}
-			
+
 			if (mClosed) throw new IOException("This InputStream was closed");
-			
-			min = length < mBufferInfo.size - mBuffer.position() ? length : mBufferInfo.size - mBuffer.position(); 
+
+			min = length < mBufferInfo.size - mBuffer.position() ? length : mBufferInfo.size - mBuffer.position();
 			mBuffer.get(buffer, offset, min);
 			if (mBuffer.position()>=mBufferInfo.size) {
 				mMediaCodec.releaseOutputBuffer(mIndex, false);
 				mBuffer = null;
 			}
-			
+
 		} catch (RuntimeException e) {
-			e.printStackTrace();
+			Log.e(TAG, "Error reading encoder output", e);
 		}
 
 		return min;
+	}
+
+	/**
+	 * Grabs SPS/PPS (csd-0/csd-1) from the encoder's current output format and hands them to the
+	 * packetizer, if not already done. Callable at any point after the encoder has started -
+	 * MediaCodec.getOutputFormat() always reflects the latest format, so this doesn't depend on
+	 * having caught the one-shot INFO_OUTPUT_FORMAT_CHANGED signal.
+	 */
+	private void extractStreamParametersIfNeeded() {
+		if (mStreamParametersSet || mH264Packetizer == null) {
+			return;
+		}
+		MediaFormat format = mMediaFormat != null ? mMediaFormat : mMediaCodec.getOutputFormat();
+		ByteBuffer spsBuffer = format.getByteBuffer("csd-0");
+		ByteBuffer ppsBuffer = format.getByteBuffer("csd-1");
+		if (spsBuffer == null || ppsBuffer == null) {
+			Log.w(TAG, "csd-0/csd-1 not available yet on encoder output format");
+			return;
+		}
+		try {
+			// Real data are preceded by \x00\x00\x00\x01, skip this prefix
+			// https://developer.android.com/reference/android/media/MediaCodec
+			spsBuffer.position(4);
+			ppsBuffer.position(4);
+			byte[] sps = new byte[spsBuffer.remaining()];
+			byte[] pps = new byte[ppsBuffer.remaining()];
+			spsBuffer.get(sps);
+			ppsBuffer.get(pps);
+			mH264Packetizer.setStreamParameters(pps, sps);
+			mStreamParametersSet = true;
+			Log.i(TAG, "SPS/PPS extracted and handed to packetizer (sps=" + sps.length + "B, pps=" + pps.length + "B)");
+		} catch (RuntimeException e) {
+			Log.e(TAG, "Failed to extract SPS/PPS from encoder output format", e);
+		}
 	}
 
 	public void setH264Packetizer(H264Packetizer packetizer) {
