@@ -187,7 +187,6 @@ public class H264Packetizer extends AbstractPacketizer implements Runnable {
 		// Those should allow the H264 stream to be decoded even if no SDP was sent to the decoder.
 		if (type == 5 && sps != null && pps != null) {
 			buffer = socket.requestBuffer();
-			socket.markNextPacket();
 			socket.updateTimestamp(ts);
 			System.arraycopy(stapa, 0, buffer, rtphl, stapa.length);
 			super.send(rtphl+stapa.length);
