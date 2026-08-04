@@ -44,6 +44,9 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     private PeerConnection peerConnection;
     private DataChannel dataChannel;
     private boolean joined;
+    private boolean sendChannelOpenHandled;
+    private SharingEngine.CompletionHandler completionHandler;
+    private SharingEngine.EventListener eventListener;
 
     private boolean dcResult;
     private Object dcResultLock = new Object();
@@ -71,6 +74,8 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     }
 
     public void createPeerConnection(final SharingEngine.CompletionHandler completionHandler, final SharingEngine.EventListener eventListener) {
+        this.completionHandler = completionHandler;
+        this.eventListener = eventListener;
         // No ICE servers required for textroom: textroom messages are all coming through Janus
         List<PeerConnection.IceServer> iceServers = new LinkedList<>();
         peerConnection = peerConnectionFactory.createPeerConnection(iceServers, new PeerConnection.Observer() {
@@ -117,85 +122,14 @@ public class JanusTextRoomPlugin extends JanusPlugin {
             }
 
             @Override
-            public void onDataChannel(DataChannel dataChannel) {
-                Log.d(Const.LOG_TAG, "Textroom plugin: onDataChannel, id=" + dataChannel.id() + ", label=" + dataChannel.label());
-                dataChannel.registerObserver(new DataChannel.Observer() {
-                    @Override
-                    public void onBufferedAmountChange(long l) {
-                        Log.d(Const.LOG_TAG, "Textroom plugin: dataChannel - onBufferedAmountChange=" + l);
-                    }
-
-                    @Override
-                    public void onStateChange() {
-                        Log.d(Const.LOG_TAG, "Textroom plugin: dataChannel - onStateChange");
-                    }
-
-                    @Override
-                    public void onMessage(DataChannel.Buffer buffer) {
-                        String message = Utils.byteBufferToString(buffer.data);
-                        Log.d(Const.LOG_TAG, "Textroom plugin: got message from DataChannel: " + message);
-
-                        try {
-                            JSONObject jsonObject = new JSONObject(message);
-                            String type = jsonObject.optString("textroom");
-                            if ("join".equalsIgnoreCase(type)) {
-                                if (!checkJoined()) {
-                                    return;
-                                }
-                                Log.d(Const.LOG_TAG, "Remote control agent connected, starting sharing");
-                                String username = jsonObject.optString("username");
-                                if (eventListener != null) {
-                                    handler.post(() -> eventListener.onStartSharing(username));
-                                }
-                            } else if ("message".equalsIgnoreCase(type)) {
-                                if (!checkJoined()) {
-                                    return;
-                                }
-                                String text = jsonObject.optString("text");
-                                if (text.startsWith("ping,")) {
-                                    String[] parts = text.split(",");
-                                    sendMessage("pong," + parts[1], false);
-                                    handler.post(() -> eventListener.onPing());
-                                } else if (text.startsWith("pong,")) {
-                                    // Echo from our response, do nothing
-                                } else if (eventListener != null) {
-                                    Log.d(Const.LOG_TAG, "Dispatching message: " + text);
-                                    handler.post(() -> eventListener.onRemoteControlEvent(text));
-                                }
-                            } else if ("leave".equalsIgnoreCase(type)) {
-                                if (!checkJoined()) {
-                                    return;
-                                }
-                                Log.d(Const.LOG_TAG, "Remote control agent disconnected, stopping sharing");
-                                if (eventListener != null) {
-                                    handler.post(() -> eventListener.onStopSharing());
-                                }
-                            } else if ("success".equalsIgnoreCase(type)) {
-                                JSONArray list = jsonObject.optJSONArray("list");
-                                if (list != null) {
-                                    // This is the response to test request, nothing to do
-                                    return;
-                                }
-                                synchronized (dcResultLock) {
-                                    dcResult = true;
-                                    dcResultLock.notify();
-                                }
-                            } else if ("error".equalsIgnoreCase(type)) {
-                                synchronized (dcResultLock) {
-                                    dcResult = false;
-                                    dcResultLock.notify();
-                                }
-                            } else {
-                                Log.d(Const.LOG_TAG, "Ignoring this message");
-                            }
-
-                        } catch (JSONException e) {
-                            Log.w(Const.LOG_TAG, "Failed to parse JSON, ignoring!");
-                        }
-                    }
-                });
-                // Here's a final point of data channel creation
-                completionHandler.onComplete(true, null);
+            public void onDataChannel(DataChannel remoteDataChannel) {
+                // Janus's TextRoom plugin doesn't reply on the channel we send from (see
+                // attachDataChannel() below) - it opens its own separate channel (observed label
+                // "JanusDataChannel") back at us and sends all responses/events there instead.
+                // This is where incoming traffic actually arrives, so it needs the same message
+                // handling attached, independent from our own send channel.
+                Log.d(Const.LOG_TAG, "Textroom plugin: onDataChannel, id=" + remoteDataChannel.id() + ", label=" + remoteDataChannel.label());
+                attachDataChannel(remoteDataChannel);
             }
 
             @Override
@@ -217,6 +151,115 @@ public class JanusTextRoomPlugin extends JanusPlugin {
             return false;
         }
         return true;
+    }
+
+    // Registers message handling on a data channel - may be called for our own locally-created
+    // send channel (from onWebRtcUp()) and/or a channel Janus opens back at us (from onDataChannel()
+    // above) - both need the same JSON dispatch logic since Janus replies on its own channel, not
+    // ours. Does NOT touch the `dataChannel` field (that's set only once, to our actual send
+    // channel, in onWebRtcUp) - only the identity check in onStateChange below cares which channel
+    // this is. Sending anything before a channel reaches OPEN gets silently swallowed (never
+    // reaches Janus) on this WebRTC library, unlike the old one this app was originally written
+    // against - so real traffic (the "list" ping and everything after it) waits for our own send
+    // channel's onStateChange() to report OPEN.
+    private void attachDataChannel(DataChannel dc) {
+        dc.registerObserver(new DataChannel.Observer() {
+            @Override
+            public void onBufferedAmountChange(long l) {
+                Log.d(Const.LOG_TAG, "Textroom plugin: dataChannel[" + dc.label() + "] - onBufferedAmountChange=" + l);
+            }
+
+            @Override
+            public void onStateChange() {
+                Log.d(Const.LOG_TAG, "Textroom plugin: dataChannel[" + dc.label() + "] - onStateChange: " + dc.state());
+                if (dc == dataChannel && dc.state() == DataChannel.State.OPEN) {
+                    onSendChannelOpen();
+                }
+            }
+
+            @Override
+            public void onMessage(DataChannel.Buffer buffer) {
+                String message = Utils.byteBufferToString(buffer.data);
+                Log.d(Const.LOG_TAG, "Textroom plugin: got message from DataChannel: " + message);
+
+                try {
+                    JSONObject jsonObject = new JSONObject(message);
+                    String type = jsonObject.optString("textroom");
+                    if ("join".equalsIgnoreCase(type)) {
+                        if (!checkJoined()) {
+                            return;
+                        }
+                        Log.d(Const.LOG_TAG, "Remote control agent connected, starting sharing");
+                        String username = jsonObject.optString("username");
+                        if (eventListener != null) {
+                            handler.post(() -> eventListener.onStartSharing(username));
+                        }
+                    } else if ("message".equalsIgnoreCase(type)) {
+                        if (!checkJoined()) {
+                            return;
+                        }
+                        String text = jsonObject.optString("text");
+                        if (text.startsWith("ping,")) {
+                            String[] parts = text.split(",");
+                            sendMessage("pong," + parts[1], false);
+                            handler.post(() -> eventListener.onPing());
+                        } else if (text.startsWith("pong,")) {
+                            // Echo from our response, do nothing
+                        } else if (eventListener != null) {
+                            Log.d(Const.LOG_TAG, "Dispatching message: " + text);
+                            handler.post(() -> eventListener.onRemoteControlEvent(text));
+                        }
+                    } else if ("leave".equalsIgnoreCase(type)) {
+                        if (!checkJoined()) {
+                            return;
+                        }
+                        Log.d(Const.LOG_TAG, "Remote control agent disconnected, stopping sharing");
+                        if (eventListener != null) {
+                            handler.post(() -> eventListener.onStopSharing());
+                        }
+                    } else if ("success".equalsIgnoreCase(type)) {
+                        JSONArray list = jsonObject.optJSONArray("list");
+                        if (list != null) {
+                            // This is the response to test request, nothing to do
+                            return;
+                        }
+                        synchronized (dcResultLock) {
+                            dcResult = true;
+                            dcResultLock.notify();
+                        }
+                    } else if ("error".equalsIgnoreCase(type)) {
+                        synchronized (dcResultLock) {
+                            dcResult = false;
+                            dcResultLock.notify();
+                        }
+                    } else {
+                        Log.d(Const.LOG_TAG, "Ignoring this message");
+                    }
+
+                } catch (JSONException e) {
+                    Log.w(Const.LOG_TAG, "Failed to parse JSON, ignoring!");
+                }
+            }
+        });
+        // Covers the case where our send channel is already OPEN by the time we attach to it.
+        if (dc == dataChannel && dc.state() == DataChannel.State.OPEN) {
+            onSendChannelOpen();
+        }
+    }
+
+    // Called once our own send channel is actually usable. Sends the initial "list" ping (which
+    // also serves to confirm the channel really works) and only then signals completion, so the
+    // rest of the connect flow (createRoom/joinRoom) doesn't start sending until traffic can
+    // actually get through. Janus's reply to this (and everything else) arrives on the separate
+    // channel it opens back at us - see onDataChannel() / attachDataChannel() above.
+    private void onSendChannelOpen() {
+        if (sendChannelOpenHandled) {
+            return;
+        }
+        sendChannelOpenHandled = true;
+        String message = "{\"textroom\":\"list\",\"transaction\":\"" + Utils.generateTransactionId() + "\"}";
+        sendToDataChannel(message);
+        completionHandler.onComplete(true, null);
     }
 
 
@@ -378,21 +421,24 @@ public class JanusTextRoomPlugin extends JanusPlugin {
         DataChannel.Init init = new DataChannel.Init();
 
         // This is running in a main thread and may hang up (a WebRTC fault)!!!
-        final AsyncTask<Void,Void,Void> asyncTask = new AsyncTask<Void, Void, Void>() {
+        final AsyncTask<Void,Void,DataChannel> asyncTask = new AsyncTask<Void, Void, DataChannel>() {
             @Override
-            protected Void doInBackground(Void... voids) {
-                dataChannel = peerConnection.createDataChannel("Trick", init);
-                return null;
+            protected DataChannel doInBackground(Void... voids) {
+                return peerConnection.createDataChannel("Trick", init);
             }
 
             @Override
-            protected void onPostExecute(Void v) {
+            protected void onPostExecute(DataChannel dc) {
                 if (hangupProtectionRunnable != null) {
                     handler.removeCallbacks(hangupProtectionRunnable);
                 }
-                // We need to send something into the data channel, otherwise it won't be initialized
-                String message = "{\"textroom\":\"list\",\"transaction\":\"" + Utils.generateTransactionId() + "\"}";
-                sendToDataChannel(message);
+                // We create this channel locally, so onDataChannel() on the PeerConnection.Observer
+                // won't fire for it (that's only for remote-initiated channels) - attach it directly.
+                // This is our actual send channel (see the `dataChannel` field javadoc above).
+                // attachDataChannel() defers sending anything until it reaches OPEN (see
+                // onSendChannelOpen()) - sending immediately here got silently dropped.
+                dataChannel = dc;
+                attachDataChannel(dc);
             }
         }.execute();
 

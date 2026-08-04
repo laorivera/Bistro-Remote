@@ -1,10 +1,9 @@
 apply plugin: 'com.android.application'
-apply plugin: 'com.google.gms.google-services'
-apply plugin: 'com.google.firebase.crashlytics'
 
 android {
-    compileSdkVersion 29
-    buildToolsVersion "29.0.3"
+    namespace 'com.hmdm.control'
+    compileSdkVersion 36
+    buildToolsVersion "36.0.0"
 
     defaultConfig {
         applicationId "com.hmdm.control"
@@ -37,6 +36,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
+
+    buildFeatures {
+        buildConfig true
+    }
 }
 
 dependencies {
@@ -59,9 +62,8 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-annotations:2.9.4'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.9.4'
 
-    implementation 'com.google.firebase:firebase-crashlytics:17.2.1'
-
-    // WebRTC
-    implementation 'org.webrtc:google-webrtc:1.0.+'
+    // WebRTC (org.webrtc:google-webrtc was discontinued by Google; this mirrors the same
+    // org.webrtc.* prebuilt AAR under a maintained Maven Central coordinate)
+    implementation 'io.github.webrtc-sdk:android:125.6422.07'
     implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.0.0'
 }

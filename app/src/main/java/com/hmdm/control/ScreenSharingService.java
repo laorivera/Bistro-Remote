@@ -264,13 +264,51 @@ public class ScreenSharingService extends Service {
                 /*Handler*/);
     }
 
-    private boolean initRecorder() {
+    // Hardware AVC encoders on some devices silently produce zero output frames (no error, no
+    // exception - dequeueOutputBuffer just times out forever) when given dimensions that aren't
+    // aligned to their required macroblock alignment. Google's software encoder is far more
+    // tolerant, so prefer it; alignScreenForCodec() below covers whichever encoder we end up with.
+    private static final String GOOGLE_AVC_ENCODER_NAME = "OMX.google.h264.encoder";
+
+    private static MediaCodec createAvcEncoder() {
+        MediaCodec codec = null;
         try {
-            mMediaCodec = MediaCodec.createEncoderByType(MIME_TYPE_VIDEO);
-        } catch (IOException e) {
-            e.printStackTrace();
+            codec = MediaCodec.createByCodecName(GOOGLE_AVC_ENCODER_NAME);
+        } catch (Exception e) {
+            Log.w(Const.LOG_TAG, "Google software AVC encoder unavailable, falling back to device default", e);
+        }
+        if (codec == null) {
+            try {
+                codec = MediaCodec.createEncoderByType(MIME_TYPE_VIDEO);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return null;
+            }
+        }
+        Log.i(Const.LOG_TAG, "Using AVC encoder: " + codec.getName());
+        return codec;
+    }
+
+    private void alignScreenForCodec(MediaCodec codec) {
+        try {
+            MediaCodecInfo.VideoCapabilities videoCapabilities =
+                    codec.getCodecInfo().getCapabilitiesForType(MIME_TYPE_VIDEO).getVideoCapabilities();
+            int widthAlignment = videoCapabilities.getWidthAlignment();
+            int heightAlignment = videoCapabilities.getHeightAlignment();
+            mScreenWidth = -widthAlignment & mScreenWidth;
+            mScreenHeight = -heightAlignment & mScreenHeight;
+            Log.d(Const.LOG_TAG, "Aligned video size for codec: width=" + mScreenWidth + ", height=" + mScreenHeight);
+        } catch (Exception e) {
+            Log.w(Const.LOG_TAG, "Failed to align screen dimensions to codec requirements", e);
+        }
+    }
+
+    private boolean initRecorder() {
+        mMediaCodec = createAvcEncoder();
+        if (mMediaCodec == null) {
             return false;
         }
+        alignScreenForCodec(mMediaCodec);
 
         MediaFormat mediaFormat = MediaFormat.createVideoFormat(MIME_TYPE_VIDEO, mScreenWidth, mScreenHeight);
         mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBitrate);
